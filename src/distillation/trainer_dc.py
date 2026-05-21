@@ -226,10 +226,7 @@ class TrainerDC(TrainerBase):
                             )
                             loss_dc_label = (1 - grad_sim_label) / num_labels
 
-                        # backward for each label
-                        scaler.scale(
-                            loss_dc_label * (1 - self.config.lm_lambda)
-                        ).backward()
+                        loss_label = loss_dc_label * (1 - self.config.lm_lambda)
 
                         if self.config.dm_lambda > 0:
                             with amp.autocast(
@@ -275,10 +272,13 @@ class TrainerDC(TrainerBase):
                                 reward = reward.detach()
                                 loss_dm_label = (reward * gen_losses).mean()
 
-                            scaler.scale(
-                                loss_dm_label * self.config.dm_lambda / num_labels
-                            ).backward()
+                            loss_label = (
+                                loss_label
+                                + loss_dm_label * self.config.dm_lambda / num_labels
+                            )
                             loss_dm += loss_dm_label.item()
+
+                        scaler.scale(loss_label).backward()
 
                         grad_sim += grad_sim_label.item()
 
