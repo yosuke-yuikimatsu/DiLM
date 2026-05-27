@@ -1,7 +1,41 @@
+# Project artefacts
 mlruns/
 save/
 data/
 analysis/
 
+# Editors / OS
 .vscode/
+.idea/
+.DS_Store
+*.swp
+
+# Python caches
 __pycache__/
+*.py[cod]
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Packaging / build
+build/
+dist/
+*.egg-info/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Logs / secrets
+*.log
+.env
+.env.*
+
+# ML artefacts
+wandb/
+*.ckpt
+*.pt
+*.pth
+*.bin
+*.safetensors
