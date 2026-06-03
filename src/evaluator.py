@@ -17,7 +17,13 @@ from transformers import DataCollatorWithPadding
 from data import DataModule
 from dataset_attrs import DATASET_ATTRS
 from learner import LearnerModel, LearnerModelForFewShot
-from utils import average, batch_to_cuda, configure_optimizer, endless_dataloader
+from utils import (
+    average,
+    batch_to_cuda,
+    configure_optimizer,
+    endless_dataloader,
+    tqdm_disabled,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -145,7 +151,11 @@ class Evaluator:
 
         results_for_dataset = []
         for i in trange(
-            n_eval_per_dataset, dynamic_ncols=True, leave=False, desc="Evaluate dataset"
+            n_eval_per_dataset,
+            dynamic_ncols=True,
+            leave=False,
+            desc="Evaluate dataset",
+            disable=tqdm_disabled(),
         ):
             train_loader = data_module.get_train_loader(
                 train_dataset,
@@ -188,6 +198,7 @@ class Evaluator:
             leave=False,
             dynamic_ncols=True,
             desc="Train learner",
+            disable=tqdm_disabled(),
         ):
 
             batch = next(train_loader)
@@ -215,7 +226,11 @@ class Evaluator:
 
         total_loss, num_samples = 0, 0
         for batch in tqdm(
-            data_loader, dynamic_ncols=True, leave=False, desc="Evaluate learner"
+            data_loader,
+            dynamic_ncols=True,
+            leave=False,
+            desc="Evaluate learner",
+            disable=tqdm_disabled(),
         ):
             batch = batch["learner"]
             with amp.autocast(enabled=self.use_amp, dtype=self.amp_dtype):
@@ -430,7 +445,11 @@ class EvaluatorForFewShot(Evaluator):
 
         results_for_dataset = []
         for i in trange(
-            n_eval_per_dataset, dynamic_ncols=True, leave=False, desc="Evaluate dataset"
+            n_eval_per_dataset,
+            dynamic_ncols=True,
+            leave=False,
+            desc="Evaluate dataset",
+            disable=tqdm_disabled(),
         ):
             # preprocess eval_dataset with few-shot prompt
             eval_dataset = get_eval_dataset(
@@ -461,7 +480,11 @@ class EvaluatorForFewShot(Evaluator):
         """
 
         for batch in tqdm(
-            data_loader, dynamic_ncols=True, leave=False, desc="Evaluate learner"
+            data_loader,
+            dynamic_ncols=True,
+            leave=False,
+            desc="Evaluate learner",
+            disable=tqdm_disabled(),
         ):
             assert "labels" in batch.keys()
             assert "input_ids" in batch.keys()
