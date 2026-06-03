@@ -170,6 +170,57 @@ class LearnerModel(nn.Module):
             attentions=outputs.attentions,
         )
 
+    def get_features(
+        self,
+        hidden_layers=(-1,),
+        pooling: str = "cls",
+        **inputs,
+    ) -> torch.Tensor:
+        """Extract sentence features for distribution matching.
+
+        Runs the BERT encoder with ``output_hidden_states=True`` and returns the
+        pooled representation of each requested hidden layer concatenated along
+        the feature dimension.
+
+        Args:
+            hidden_layers: indices of hidden states to use (``hidden_states`` has
+                ``num_layers + 1`` entries, where index ``0`` is the embedding
+                output and ``-1`` is the last layer). Multiple indices are
+                concatenated.
+            pooling: ``"cls"`` uses the first ([CLS]) token, ``"mean"`` uses the
+                attention-masked mean over tokens.
+            **inputs: tokenized batch (``input_ids``, ``attention_mask``, ...).
+                A ``labels`` entry, if present, is ignored.
+
+        Returns:
+            Tensor of shape ``(batch_size, hidden_size * len(hidden_layers))``.
+        """
+        inputs.pop("labels", None)
+        attention_mask = inputs.get("attention_mask", None)
+
+        outputs = self.bert_model(**inputs, output_hidden_states=True)
+        # hidden_states: tuple of (num_layers + 1) tensors of (B, L, H)
+        hidden_states = outputs.hidden_states
+
+        features = []
+        for layer in hidden_layers:
+            layer_hidden = hidden_states[layer]  # (B, L, H)
+            if pooling == "cls":
+                pooled = layer_hidden[:, 0]  # (B, H)
+            elif pooling == "mean":
+                if attention_mask is None:
+                    pooled = layer_hidden.mean(dim=1)
+                else:
+                    mask = attention_mask.unsqueeze(-1).to(layer_hidden.dtype)
+                    pooled = (layer_hidden * mask).sum(dim=1) / mask.sum(
+                        dim=1
+                    ).clamp(min=1e-6)
+            else:
+                raise ValueError(f"Unknown pooling type: `{pooling}`")
+            features.append(pooled)
+
+        return torch.cat(features, dim=-1)  # (B, H * len(hidden_layers))
+
     def resize_token_embeddings(self, *args, **kwargs):
         return self.bert_model.resize_token_embeddings(*args, **kwargs)
 
