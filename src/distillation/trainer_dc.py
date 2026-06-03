@@ -16,7 +16,13 @@ from data import DataModule
 from evaluator import EvaluateConfig, Evaluator
 from generator import GeneratorModel
 from learner import LearnerModel
-from utils import average, batch_to_cuda, configure_optimizer, endless_dataloader
+from utils import (
+    average,
+    batch_to_cuda,
+    configure_optimizer,
+    endless_dataloader,
+    tqdm_disabled,
+)
 
 from .trainer_base import TrainerBase
 
@@ -161,6 +167,7 @@ class TrainerDC(TrainerBase):
                 dynamic_ncols=True,
                 leave=False,
                 desc="Inner loop",
+                disable=tqdm_disabled(),
             ):
                 # compute matching loss (gradient and/or distribution matching)
                 # dm_mode: "none" -> DC only, "regularizer" -> DC + DM,

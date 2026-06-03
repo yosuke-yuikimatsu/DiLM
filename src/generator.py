@@ -1,5 +1,8 @@
+import copy
 import logging
 import os
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -13,6 +16,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedModel
 from transformers.modeling_outputs import CausalLMOutputWithCrossAttentions
 
 from dataset_attrs import DATASET_ATTRS
+from utils import tqdm_disabled
 
 logger = logging.getLogger(__name__)
 
@@ -28,6 +32,10 @@ class GeneratorConfig:
     top_k: int | None = None
     repetition_penalty: float = 1.0
     generate_batch_size: int = 32
+    # number of GPUs to shard data generation across.
+    #   1  -> single GPU (default, unchanged behavior)
+    #   N  -> use N GPUs;  -1 -> use all visible GPUs
+    generate_num_gpus: int = 1
     generate_max_length: int | None = None
     generate_bf16: bool = False
     generate_fp16: bool = False
@@ -132,48 +140,37 @@ class GeneratorModel(nn.Module):
 
         data_size_per_dataset = dpc * self.num_labels
         data_size = data_size_per_dataset * n
-        generate_list = {
-            sample_id: {
+        generate_list = [
+            {
                 "sample_id": sample_id,
                 "bos_token": [self.bos_token_ids_map[sample_id % self.num_labels]],
                 "text": None,
                 "labels": sample_id % self.num_labels,
             }
             for sample_id in range(data_size)
-        }
+        ]
 
-        # generate data
-        generated_data = {}
-        retry_count = 0
+        devices = self.generate_devices()
+
+        # generate data (optionally sharded across multiple GPUs)
         with trange(
             data_size,
             leave=False,
             dynamic_ncols=True,
             desc="Generating data",
+            disable=tqdm_disabled(),
         ) as pbar:
-            while len(generate_list) > 0:
-                batch = []
-                for sample in generate_list.values():
-                    batch.append(sample)
-                    if len(batch) == self.config.generate_batch_size:
-                        break
-                generated_samples = self.batch_generate(batch)
-                num_error = len(batch) - len(generated_samples)
-                if num_error > 0:
-                    logger.warning(f"Number of failed samples is {num_error} (retry)")
-                    retry_count += num_error
-                    assert (
-                        retry_count < data_size
-                    ), "Too many samples failed to generate!!"
-
-                for sample_id, generated_sample in generated_samples.items():
-                    generate_list.pop(sample_id)
-                    generated_data[sample_id] = generated_sample
-
-                pbar.update(len(generated_samples))
+            if len(devices) <= 1:
+                generated_data = self.generate_on_device(
+                    generate_list, self.model, self.device, data_size, pbar
+                )
+            else:
+                generated_data = self.generate_multi_gpu(
+                    generate_list, devices, data_size, pbar
+                )
 
         # sort by sample id
-        generated_data = [sample_id for _, sample_id in sorted(generated_data.items())]
+        generated_data = [sample for _, sample in sorted(generated_data.items())]
 
         for i in range(n):
             dataset_list.append(
@@ -186,13 +183,135 @@ class GeneratorModel(nn.Module):
 
         return dataset_list
 
+    def generate_devices(self) -> list[torch.device]:
+        """List of CUDA devices to shard generation across."""
+        if self.device.type != "cuda":
+            return [self.device]
+        available = torch.cuda.device_count()
+        num_gpus = self.config.generate_num_gpus
+        if num_gpus is None or num_gpus < 0:
+            num_gpus = available
+        num_gpus = min(max(num_gpus, 1), available)
+        if num_gpus <= 1:
+            return [self.device]
+        return [torch.device("cuda", i) for i in range(num_gpus)]
+
+    def generate_on_device(
+        self,
+        samples: list[dict],
+        model: PreTrainedModel,
+        device: torch.device,
+        retry_budget: int,
+        pbar=None,
+        pbar_lock=None,
+    ) -> dict[int, dict]:
+        """Generate (with retry) for a list of samples on a single device."""
+        pending = {sample["sample_id"]: sample for sample in samples}
+        results = {}
+        retry_count = 0
+        while len(pending) > 0:
+            batch = []
+            for sample in pending.values():
+                batch.append(sample)
+                if len(batch) == self.config.generate_batch_size:
+                    break
+            generated_samples = self.batch_generate(batch, model=model, device=device)
+            num_error = len(batch) - len(generated_samples)
+            if num_error > 0:
+                logger.warning(f"Number of failed samples is {num_error} (retry)")
+                retry_count += num_error
+                assert retry_count < retry_budget, "Too many samples failed to generate!!"
+
+            for sample_id, generated_sample in generated_samples.items():
+                pending.pop(sample_id)
+                results[sample_id] = generated_sample
+
+            if pbar is not None:
+                if pbar_lock is not None:
+                    with pbar_lock:
+                        pbar.update(len(generated_samples))
+                else:
+                    pbar.update(len(generated_samples))
+
+        return results
+
+    def generate_multi_gpu(
+        self,
+        samples: list[dict],
+        devices: list[torch.device],
+        retry_budget: int,
+        pbar=None,
+    ) -> dict[int, dict]:
+        """Shard generation across GPUs with one model replica per device.
+
+        Each device runs in its own thread on an independent (frozen, eval) copy
+        of the current generator weights; results are merged at the end. On any
+        replication failure this falls back to single-GPU generation.
+        """
+        try:
+            # device 0 reuses the live model; the rest get fresh weight copies
+            replicas = {devices[0]: self.model}
+            for device in devices[1:]:
+                replica = copy.deepcopy(self.model).to(device)
+                replica.eval()
+                replicas[device] = replica
+        except Exception as error:  # noqa: BLE001 - any failure -> safe fallback
+            logger.warning(
+                f"Failed to replicate generator across GPUs ({error}); "
+                "falling back to single-GPU generation."
+            )
+            return self.generate_on_device(
+                samples, self.model, self.device, retry_budget, pbar
+            )
+
+        # shard samples round-robin across devices
+        shards = {device: [] for device in devices}
+        for i, sample in enumerate(samples):
+            shards[devices[i % len(devices)]].append(sample)
+
+        results = {}
+        results_lock = threading.Lock()
+        pbar_lock = threading.Lock()
+
+        def worker(device):
+            with torch.cuda.device(device):
+                shard_results = self.generate_on_device(
+                    shards[device],
+                    replicas[device],
+                    device,
+                    retry_budget,
+                    pbar,
+                    pbar_lock,
+                )
+            with results_lock:
+                results.update(shard_results)
+
+        with ThreadPoolExecutor(max_workers=len(devices)) as executor:
+            futures = [executor.submit(worker, device) for device in devices]
+            for future in futures:
+                future.result()  # propagate any exception from the worker threads
+
+        # free replicas (keep self.model on device 0)
+        for device in devices[1:]:
+            replicas.pop(device, None)
+        torch.cuda.empty_cache()
+
+        return results
+
     @torch.inference_mode()
-    def batch_generate(self, batch: list[dict]) -> dict[int, dict]:
+    def batch_generate(
+        self,
+        batch: list[dict],
+        model: PreTrainedModel | None = None,
+        device: torch.device | None = None,
+    ) -> dict[int, dict]:
+        model = self.model if model is None else model
+        device = self.device if device is None else device
         inputs = [sample["bos_token"] for sample in batch]
 
         with amp.autocast(enabled=self.use_amp, dtype=self.amp_dtype):
-            outputs = self.model.generate(
-                torch.as_tensor(inputs, dtype=int, device=self.device),
+            outputs = model.generate(
+                torch.as_tensor(inputs, dtype=int, device=device),
                 do_sample=True,
                 top_p=self.config.top_p,
                 top_k=self.config.top_k,

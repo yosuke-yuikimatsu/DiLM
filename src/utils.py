@@ -1,3 +1,5 @@
+import os
+
 import mlflow
 import numpy as np
 import torch
@@ -42,6 +44,22 @@ def log_params_from_omegaconf_dict(params):
 
 def batch_to_cuda(batch: dict[str, torch.Tensor] | BatchEncoding):
     return {k: v.cuda() for k, v in batch.items()}
+
+
+def tqdm_disabled() -> bool:
+    """Whether to disable the noisy/nested tqdm progress bars.
+
+    Set ``DILM_DISABLE_TQDM=1`` to silence the per-step training, data
+    generation and evaluation bars (the periodic metric logs are kept, and the
+    outer-loop heartbeat bar stays on). tqdm's own ``TQDM_DISABLE=1`` instead
+    disables *all* bars including the outer-loop one.
+    """
+    return os.environ.get("DILM_DISABLE_TQDM", "0").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
 
 
 def endless_dataloader(data_loader, max_iteration=1000000):

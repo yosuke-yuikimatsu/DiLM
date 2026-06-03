@@ -251,6 +251,51 @@ locally:
 $ mlflow server --backend-store-uri ./mlruns --host 0.0.0.0 --port 5000
 ```
 
+## Performance: multi-GPU generation & quiet logging
+
+### Multi-GPU generation
+
+Synthetic-data generation (autoregressive GPT-2) is the dominant cost of the `dc`
+run and is embarrassingly parallel, so it can be sharded across GPUs. Set
+`generator.generate_num_gpus`:
+
+```python
+!python src/train.py --config-name=dc data.task_name=sst2 +generator=pretrained_sst2 \
+    generator.generate_num_gpus=2 \
+    train.dm_mode=standalone train.use_projectors=False ...
+```
+
+- `generate_num_gpus=1` (default) — single GPU, unchanged behavior.
+- `generate_num_gpus=N` — shard generation across `N` GPUs (e.g. `2` for a Kaggle
+  T4 ×2). `-1` uses all visible GPUs.
+
+Each GPU runs an independent (frozen, eval) copy of the current generator weights
+in its own thread; results are merged. On any replication failure it falls back
+to single-GPU generation. Only **generation** is parallelized — the gradient /
+distribution-matching step relies on `torch.func` and is left on the main GPU, so
+the speed-up applies to the generation portion of each loop.
+
+### Reducing progress-bar spam
+
+On Kaggle the nested tqdm bars (the per-step learner-training bar during
+validation, the data-generation bar, the inner-loop bar) are not collapsed and
+flood the output. Silence them while keeping the periodic metric logs:
+
+```python
+import os
+os.environ["DILM_DISABLE_TQDM"] = "1"   # propagates to the !python subprocess
+```
+
+`DILM_DISABLE_TQDM=1` disables the noisy nested bars but keeps the outer-loop
+heartbeat. To disable **every** bar (including the heartbeat), use tqdm's built-in
+`os.environ["TQDM_DISABLE"] = "1"` instead. The `train.*` metric lines logged
+every `train.log_interval` steps are unaffected either way.
+
+> Validation cost is dominated by `evaluate.train_step` (the learner is retrained
+> from scratch on the distilled data at every `train.val_interval`). If validation
+> feels too frequent/slow, increase `train.val_interval` and/or lower
+> `evaluate.train_step` / `evaluate.n_eval_per_dataset`.
+
 ## Citation
 
 ```
