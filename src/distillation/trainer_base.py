@@ -1,7 +1,7 @@
 import logging
 import os
 from abc import ABCMeta, abstractmethod
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Generator
 
 import mlflow
@@ -36,6 +36,21 @@ class TrainConfig:
 
     lm_lambda: float = 0.01
     lm_batch_size: int = 64
+
+    # distribution matching (DM) of the learner's features
+    # dm_mode:
+    #   "none"        -> gradient matching only (default DiLM behavior)
+    #   "regularizer" -> gradient matching + dm_lambda * DM loss
+    #   "standalone"  -> DM loss only (no gradient matching)
+    dm_mode: str = "none"
+    dm_lambda: float = 1.0
+    dm_hidden_layers: list[int] = field(default_factory=lambda: [-1])
+    dm_pooling: str = "cls"  # ["cls", "mean"]
+    # match features through random (frozen) MLP projectors, as in the original
+    # Distribution Matching. when False, the hidden features are matched directly.
+    use_projectors: bool = False
+    num_projectors: int = 1
+    projector_output_dim: int = 128
 
     n_clusters_for_real_sampler: int = 1
     n_clusters_for_syn_sampler: int = 1

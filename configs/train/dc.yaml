@@ -55,6 +55,21 @@ train:
   lm_lambda: 0.0
   lm_batch_size: 64
 
+  # distribution matching (DM) of the learner's hidden features
+  #   dm_mode: none -> gradient matching only (default DiLM)
+  #            regularizer -> gradient matching + dm_lambda * DM loss
+  #            standalone -> DM loss only (no gradient matching)
+  dm_mode: none # [none, regularizer, standalone]
+  dm_lambda: 1.0
+  dm_hidden_layers: [-1] # BERT hidden states to concat (-1 = last layer)
+  dm_pooling: cls # [cls, mean]
+  # match random projections of the features (original DM) instead of the
+  # features directly. num_projectors / projector_output_dim only apply when
+  # use_projectors is True.
+  use_projectors: False
+  num_projectors: 1
+  projector_output_dim: 128
+
   repset_teacher: True
   repset_dpc: ${train.gm_real_dpc}
   n_repset: 10

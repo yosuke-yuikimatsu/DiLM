@@ -5,6 +5,7 @@ from typing import Generator
 import mlflow
 import torch
 from datasets import Dataset, concatenate_datasets
+from torch import nn
 from torch.cuda import amp
 from torch.nn import functional as F
 from torch.utils.data import DataLoader
@@ -36,6 +37,11 @@ class TrainerDC(TrainerBase):
         learner.cuda()
 
         num_labels = data_module.num_labels
+
+        assert self.config.dm_mode in ("none", "regularizer", "standalone"), (
+            f"Unknown `dm_mode`: `{self.config.dm_mode}` "
+            "(expected one of: none, regularizer, standalone)"
+        )
 
         assert self.config.total_train_step % self.config.inner_loop == 0
         outer_loop = self.config.total_train_step // self.config.inner_loop
@@ -156,26 +162,60 @@ class TrainerDC(TrainerBase):
                 leave=False,
                 desc="Inner loop",
             ):
-                # compute DC loss
+                # compute matching loss (gradient and/or distribution matching)
+                # dm_mode: "none" -> DC only, "regularizer" -> DC + DM,
+                #          "standalone" -> DM only
+                compute_dc = self.config.dm_mode != "standalone"
+                compute_dm = self.config.dm_mode in ("regularizer", "standalone")
+
+                # sample a fresh set of random projectors for this step (original
+                # DM matches the distribution over many random projections)
+                projectors = None
+                if (
+                    compute_dm
+                    and self.config.use_projectors
+                    and self.config.lm_lambda < 1
+                ):
+                    in_dim = learner.bert_model.config.hidden_size * len(
+                        self.config.dm_hidden_layers
+                    )
+                    projectors = self.build_projectors(in_dim, learner.device)
+
                 grad_sim = 0.0
+                loss_dm = 0.0
                 if self.config.lm_lambda < 1:
                     for label in range(num_labels):
                         with amp.autocast(enabled=self.use_amp, dtype=self.amp_dtype):
-                            # compute gradient with real samples
+                            # compute statistics with real samples
                             # sample size: gm_real_dpc * gm_real_grad_accum_step
                             with torch.no_grad():
                                 grad_real_list = []
+                                feat_real_list = []
                                 for _ in range(self.config.gm_real_grad_accum_step):
-                                    batch_gm_real = next(gm_real_loaders[label])
-                                    grad_real = self.compute_grad(
-                                        learner=learner,
-                                        params=params,
-                                        buffers=buffers,
-                                        **batch_to_cuda(batch_gm_real["learner"]),
+                                    batch_gm_real = batch_to_cuda(
+                                        next(gm_real_loaders[label])["learner"]
                                     )
-                                    grad_real_list.append(grad_real)
+                                    if compute_dc:
+                                        grad_real_list.append(
+                                            self.compute_grad(
+                                                learner=learner,
+                                                params=params,
+                                                buffers=buffers,
+                                                **batch_gm_real,
+                                            )
+                                        )
+                                    if compute_dm:
+                                        feat_real_list.append(
+                                            self.compute_dm_features(
+                                                learner, batch_gm_real
+                                            )
+                                        )
 
-                                grad_real = torch.stack(grad_real_list).mean(0)
+                                if compute_dc:
+                                    grad_real = torch.stack(grad_real_list).mean(0)
+                                if compute_dm:
+                                    # per-sample features over all real samples
+                                    feat_real = torch.cat(feat_real_list, dim=0)
 
                             # compute generation probability
                             batch_gm_syn = next(gm_syn_loaders[label])
@@ -186,30 +226,55 @@ class TrainerDC(TrainerBase):
                                 -gen_losses / self.config.normalize_temperature,
                                 dim=-1,
                             )
-                            # compute gradient with loss weights
-                            grad_syn = self.compute_grad(
-                                learner=learner,
-                                params=params,
-                                buffers=buffers,
-                                **batch_to_cuda(batch_gm_syn["learner"]),
-                                loss_weights=loss_weights,
+                            batch_gm_syn_learner = batch_to_cuda(
+                                batch_gm_syn["learner"]
                             )
-                            grad_sim_label = F.cosine_similarity(
-                                grad_real, grad_syn, dim=0
-                            )
-                            loss_dc_label = (1 - grad_sim_label) / num_labels
+
+                            loss_match_label = torch.zeros((), device=learner.device)
+
+                            if compute_dc:
+                                # compute gradient with loss weights
+                                grad_syn = self.compute_grad(
+                                    learner=learner,
+                                    params=params,
+                                    buffers=buffers,
+                                    **batch_gm_syn_learner,
+                                    loss_weights=loss_weights,
+                                )
+                                grad_sim_label = F.cosine_similarity(
+                                    grad_real, grad_syn, dim=0
+                                )
+                                loss_dc_label = (1 - grad_sim_label) / num_labels
+                                loss_match_label = loss_match_label + loss_dc_label
+                                grad_sim += grad_sim_label.item()
+
+                            if compute_dm:
+                                # distribution matching weighted by loss weights
+                                loss_dm_label = self.compute_dm_loss(
+                                    learner=learner,
+                                    batch_learner=batch_gm_syn_learner,
+                                    loss_weights=loss_weights,
+                                    feat_real=feat_real,
+                                    projectors=projectors,
+                                )
+                                loss_match_label = (
+                                    loss_match_label
+                                    + self.config.dm_lambda
+                                    * loss_dm_label
+                                    / num_labels
+                                )
+                                loss_dm += loss_dm_label.item() / num_labels
 
                         # backward for each label
                         scaler.scale(
-                            loss_dc_label * (1 - self.config.lm_lambda)
+                            loss_match_label * (1 - self.config.lm_lambda)
                         ).backward()
 
-                        grad_sim += grad_sim_label.item()
-
                     grad_sim /= num_labels
-                    loss_dc = 1 - grad_sim
+                    loss_dc = 1 - grad_sim if compute_dc else 0.0
                 else:
                     loss_dc = 0.0
+                    loss_dm = 0.0
 
                 if self.config.lm_lambda > 0:
                     batch_lm = next(lm_loader)
@@ -225,8 +290,9 @@ class TrainerDC(TrainerBase):
                 else:
                     loss_lm = 0.0
 
+                loss_match = loss_dc + self.config.dm_lambda * loss_dm
                 loss = (
-                    loss_dc * (1 - self.config.lm_lambda)
+                    loss_match * (1 - self.config.lm_lambda)
                     + loss_lm * self.config.lm_lambda
                 )
 
@@ -236,6 +302,7 @@ class TrainerDC(TrainerBase):
                 outer_loop_train_log = {
                     "train.loss": loss,
                     "train.loss_dc": loss_dc,
+                    "train.loss_dm": loss_dm,
                     "train.loss_lm": loss_lm,
                     "train.grad_sim": grad_sim,
                 }
@@ -356,6 +423,100 @@ class TrainerDC(TrainerBase):
             }
 
         return torch.concat([grad.view(-1) for grad in grads.values()], dim=0)
+
+    def compute_dm_features(
+        self, learner: LearnerModel, batch_learner: dict[str, torch.Tensor]
+    ) -> torch.Tensor:
+        """Return concatenated hidden-layer features ``(batch_size, feat_dim)``.
+
+        The learner is used as a frozen feature extractor (no gradient, dropout
+        disabled), so it is not updated by the distribution matching loss. The
+        gradient instead flows to the generator through the generation-probability
+        ``loss_weights`` (see ``compute_dm_loss``).
+        """
+        was_training = learner.training
+        learner.eval()
+        with torch.no_grad():
+            features = learner.get_features(
+                hidden_layers=self.config.dm_hidden_layers,
+                pooling=self.config.dm_pooling,
+                **batch_learner,
+            )
+        learner.train(was_training)
+        return features
+
+    def build_projectors(
+        self, in_dim: int, device: torch.device
+    ) -> list[nn.Module]:
+        """Sample a fresh set of random (frozen) MLP projectors.
+
+        Following the original Distribution Matching, the real and synthetic
+        features are matched in the embedding space of randomly-initialized
+        networks; a new set is drawn at every step so the matching covers many
+        random projections. Each projector is a small MLP (``Linear -> ReLU ->
+        Linear``) whose weights are random and never trained.
+        """
+        projectors = []
+        for _ in range(self.config.num_projectors):
+            projector = nn.Sequential(
+                nn.Linear(in_dim, self.config.projector_output_dim),
+                nn.ReLU(),
+                nn.Linear(
+                    self.config.projector_output_dim,
+                    self.config.projector_output_dim,
+                ),
+            )
+            projector.to(device)
+            projector.requires_grad_(False)
+            projectors.append(projector)
+        return projectors
+
+    def compute_dm_loss(
+        self,
+        learner: LearnerModel,
+        batch_learner: dict[str, torch.Tensor],
+        loss_weights: torch.Tensor,
+        feat_real: torch.Tensor,
+        projectors: list[nn.Module] | None = None,
+    ) -> torch.Tensor:
+        """Distribution matching loss between real and synthetic feature means.
+
+        The synthetic feature mean is a ``loss_weights``-weighted average so that
+        the (otherwise non-differentiable, discrete) synthetic text can propagate
+        a gradient to the generator. The per-sample features (and the random
+        projector weights, if any) are detached; only ``loss_weights`` carries
+        the gradient.
+
+        If ``projectors`` is given, the features are first mapped through each
+        random (frozen) MLP and the squared distance between the projected means
+        is averaged over the projectors (original Distribution Matching).
+        Otherwise the concatenated hidden features are matched directly.
+        """
+        # (batch_size, feat_dim), detached from the learner
+        feat_syn = self.compute_dm_features(learner, batch_learner)
+
+        # compute in float32 to keep the matching stable under amp
+        with amp.autocast(enabled=False):
+            loss_weights = loss_weights.float()
+            feat_real = feat_real.float()
+            feat_syn = feat_syn.float()
+
+            if projectors is None:
+                # match the concatenated hidden features directly
+                real_mean = feat_real.mean(0)
+                # weighted mean over the synthetic batch (loss_weights sums to 1)
+                syn_mean = loss_weights @ feat_syn
+                return ((real_mean - syn_mean) ** 2).mean()
+
+            # match means under random nonlinear projections, averaged over them
+            loss_dm = feat_real.new_zeros(())
+            for projector in projectors:
+                with torch.no_grad():
+                    proj_real_mean = projector(feat_real).mean(0)
+                    proj_syn = projector(feat_syn)  # detached
+                syn_proj_mean = loss_weights @ proj_syn
+                loss_dm = loss_dm + ((proj_real_mean - syn_proj_mean) ** 2).mean()
+            return loss_dm / len(projectors)
 
     def learner_optimizer(self, learner: LearnerModel, evaluate_config: EvaluateConfig):
         return configure_optimizer(
