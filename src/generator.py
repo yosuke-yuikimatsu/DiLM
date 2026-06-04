@@ -188,7 +188,8 @@ class GeneratorModel(nn.Module):
         if self.device.type != "cuda":
             return [self.device]
         available = torch.cuda.device_count()
-        num_gpus = self.config.generate_num_gpus
+        # tolerate configs that predate this field (defaults to single GPU)
+        num_gpus = getattr(self.config, "generate_num_gpus", 1)
         if num_gpus is None or num_gpus < 0:
             num_gpus = available
         num_gpus = min(max(num_gpus, 1), available)
