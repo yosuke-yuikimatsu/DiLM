@@ -33,6 +33,7 @@ generator:
   top_k: null
   repetition_penalty: 1.0
   generate_batch_size: 512
+  generate_num_gpus: 1 # shard generation across GPUs (1 = single, -1 = all visible)
   generate_max_length: null
   generate_fp16: False
   generate_bf16: True
